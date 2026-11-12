@@ -1,0 +1,105 @@
+# Oracle Always Free A1 서버를 자리가 날 때까지 자동으로 생성 시도
+# - 매시간 실행, 한 번 실행되면 약 50분 동안 반복 시도
+# - 성공하면 이슈를 만들어 알림 + 이 워크플로를 스스로 끔
+# - 모든 OCI 값은 Secrets에서 읽고, 로그에는 OCID·IP를 출력하지 않음
+name: oracle-a1-retry
+
+on:
+  schedule:
+    - cron: "0 * * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: oracle-a1-retry
+  cancel-in-progress: false
+
+permissions:
+  actions: write
+  issues: write
+
+jobs:
+  retry:
+    runs-on: ubuntu-latest
+    timeout-minutes: 58
+    steps:
+      - name: OCI CLI 설치
+        run: pip install --quiet oci-cli
+
+      - name: OCI 인증 설정
+        env:
+          OCI_USER: ${{ secrets.OCI_USER }}
+          OCI_FINGERPRINT: ${{ secrets.OCI_FINGERPRINT }}
+          OCI_TENANCY: ${{ secrets.OCI_TENANCY }}
+          OCI_REGION: ${{ secrets.OCI_REGION }}
+          OCI_KEY: ${{ secrets.OCI_KEY }}
+          SSH_PUB: ${{ secrets.SSH_PUB }}
+        run: |
+          mkdir -p ~/.oci ~/.ssh
+          echo "$OCI_KEY" > ~/.oci/key.pem
+          echo "$SSH_PUB" > ~/.ssh/server.pub
+          chmod 600 ~/.oci/key.pem
+          cat > ~/.oci/config <<EOF
+          [DEFAULT]
+          user=$OCI_USER
+          fingerprint=$OCI_FINGERPRINT
+          tenancy=$OCI_TENANCY
+          region=$OCI_REGION
+          key_file=$HOME/.oci/key.pem
+          EOF
+          chmod 600 ~/.oci/config
+
+      - name: 자리 날 때까지 시도 (최대 50분)
+        env:
+          T: ${{ secrets.OCI_TENANCY }}
+          AD: ${{ secrets.OCI_AD }}
+          SUB: ${{ secrets.OCI_SUBNET }}
+          IMG: ${{ secrets.OCI_IMAGE }}
+          SUPPRESS_LABEL_WARNING: "True"
+          PYTHONWARNINGS: ignore
+        run: |
+          END=$(( $(date +%s) + 50*60 ))
+          SHAPES=("2:12" "1:6")
+          n=0
+          while [ "$(date +%s)" -lt "$END" ]; do
+            n=$((n+1))
+            CUR=${SHAPES[$(( (n-1) % 2 ))]}
+            OCPUS=${CUR%%:*}; MEM=${CUR##*:}
+
+            # 안전장치: 이미 chwimeet 서버가 있으면 중단 (중복 생성 방지)
+            EXIST=$(oci compute instance list -c "$T" --display-name chwimeet \
+              --query 'data[?"lifecycle-state"!=`TERMINATED` && "lifecycle-state"!=`TERMINATING`].id | [0]' \
+              --raw-output 2>/dev/null || true)
+            if [ -n "$EXIST" ] && [ "$EXIST" != "null" ]; then
+              echo "이미 chwimeet 서버가 있음 → 성공 처리"; echo "DONE=1" >> "$GITHUB_ENV"; break
+            fi
+
+            OUT=$(oci compute instance launch -c "$T" --availability-domain "$AD" \
+              --shape VM.Standard.A1.Flex --shape-config "{\"ocpus\":$OCPUS,\"memoryInGBs\":$MEM}" \
+              --image-id "$IMG" --subnet-id "$SUB" --assign-public-ip true \
+              --display-name chwimeet --ssh-authorized-keys-file ~/.ssh/server.pub \
+              --query 'data.id' --raw-output 2>&1 || true)
+
+            if [[ "$OUT" == ocid1.instance.* ]]; then
+              echo "#$n 생성 성공! (${OCPUS}/${MEM}GB)"; echo "DONE=1" >> "$GITHUB_ENV"; break
+            elif echo "$OUT" | grep -q "Out of capacity\|OutOfHostCapacity\|InternalError"; then
+              echo "[$(date -u -d '+9 hours' '+%m-%d %H:%M')] #$n 자리 없음 (${OCPUS}/${MEM}GB)"; sleep 30
+            elif echo "$OUT" | grep -q "TooManyRequests"; then
+              echo "[$(date -u -d '+9 hours' '+%m-%d %H:%M')] #$n 요청 과다(429) → 300초 대기"; sleep 300
+            elif echo "$OUT" | grep -q "NotAuthenticated\|RequestException\|timed out\|ConnectionError"; then
+              echo "[$(date -u -d '+9 hours' '+%m-%d %H:%M')] #$n 일시적 오류 → 60초 대기"; sleep 60
+            else
+              # 원문에 OCID가 들어 있을 수 있어 앞부분 코드만 출력
+              echo "#$n 예상 못 한 오류로 중단: $(echo "$OUT" | grep -o '"code": "[^"]*"' | head -1)"
+              exit 1
+            fi
+          done
+
+      - name: 성공 알림 + 워크플로 끄기
+        if: env.DONE == '1'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh issue create -R "$GITHUB_REPOSITORY" \
+            --title "Oracle A1 서버 생성 완료" \
+            --body "chwimeet 서버가 만들어졌어요. IP는 OCI 콘솔(Compute → Instances)에서 확인하세요."
+          gh workflow disable oracle-a1-retry -R "$GITHUB_REPOSITORY"
