@@ -1,12 +1,13 @@
 # Oracle Always Free A1 서버를 자리가 날 때까지 자동으로 생성 시도
-# - 매시간 실행, 한 번 실행되면 약 50분 동안 반복 시도
+# - 한 번 실행되면 약 5시간 40분 동안 반복 시도, 끝나면 다음 실행을 스스로 예약(이어달리기)
+# - 예약 실행(cron)은 GitHub 사정으로 자주 건너뛰어서, 이어달리기가 끊겼을 때를 위한 보조용
 # - 성공하면 이슈를 만들어 알림 + 이 워크플로를 스스로 끔
 # - 모든 OCI 값은 Secrets에서 읽고, 로그에는 OCID·IP를 출력하지 않음
 name: oracle-a1-retry
 
 on:
   schedule:
-    - cron: "0 * * * *"
+    - cron: "0 */3 * * *"
   workflow_dispatch:
 
 concurrency:
@@ -20,7 +21,7 @@ permissions:
 jobs:
   retry:
     runs-on: ubuntu-latest
-    timeout-minutes: 58
+    timeout-minutes: 355
     steps:
       - name: OCI CLI 설치
         run: pip install --quiet oci-cli
@@ -48,7 +49,7 @@ jobs:
           EOF
           chmod 600 ~/.oci/config
 
-      - name: 자리 날 때까지 시도 (최대 50분)
+      - name: 자리 날 때까지 시도 (최대 5시간 40분)
         env:
           T: ${{ secrets.OCI_TENANCY }}
           AD: ${{ secrets.OCI_AD }}
@@ -57,7 +58,7 @@ jobs:
           SUPPRESS_LABEL_WARNING: "True"
           PYTHONWARNINGS: ignore
         run: |
-          END=$(( $(date +%s) + 50*60 ))
+          END=$(( $(date +%s) + 340*60 ))
           SHAPES=("2:12" "1:6")
           n=0
           while [ "$(date +%s)" -lt "$END" ]; do
@@ -103,3 +104,9 @@ jobs:
             --title "Oracle A1 서버 생성 완료" \
             --body "chwimeet 서버가 만들어졌어요. IP는 OCI 콘솔(Compute → Instances)에서 확인하세요."
           gh workflow disable oracle-a1-retry -R "$GITHUB_REPOSITORY"
+
+      - name: 다음 실행 예약 (이어달리기)
+        if: env.DONE != '1'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run oracle-a1-retry -R "$GITHUB_REPOSITORY"
